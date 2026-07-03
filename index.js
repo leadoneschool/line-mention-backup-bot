@@ -1,17 +1,23 @@
 /**
- * LINE 群組「被 Tag 訊息」每日備份 Bot
+ * LINE 群組「被 Tag 訊息」備份 Bot v2
  * ------------------------------------------------
- * 功能：
- * 1. Bot 加入群組後，即時監聽所有文字訊息
- * 2. 只要訊息中有 @某人（LINE 的 mention），就把該訊息記錄下來
- * 3. 每天 23:55（台灣時間）自動把當天所有「你被 tag 的訊息」
- *    整理成「聊天截圖樣式」的卡片（Flex Message），
- *    私訊傳到被 tag 者自己的一對一聊天室當備份
+ * 功能:
+ * 1. Bot 加入群組後,即時監聽所有文字訊息
+ * 2. 訊息中有 @某人(mention)就記錄
+ * 3. 每個人可自選備份模式:
+ *    - 每日模式(預設):每天 23:55 一次寄出當天所有被 tag 的訊息
+ *    - 即時模式:一被 tag 馬上私訊轉傳
  *
- * 注意（LINE 官方限制，無法繞過）：
- * - Bot 無法真的「截圖」畫面，所以用 Flex Message 畫出對話泡泡，效果等同截圖
- * - Bot 無法幫使用者按「分享」，所以改由 Bot 直接推播私訊
- * - 被 tag 的人「必須先加 Bot 為好友」，Bot 才能私訊他
+ * 使用者指令(在「和 Bot 的一對一聊天室」輸入):
+ *    !即時   → 切換成即時轉傳
+ *    !每日   → 切換成每日彙整
+ *    !設定   → 查看目前模式
+ *    !測試 xxx → 模擬「自己被 tag」,方便一個人測試
+ *    !備份   → 立刻寄出目前累積的每日備份(測試用)
+ *
+ * 注意(LINE 官方限制):
+ * - 被 tag 的人必須先加 Bot 好友,Bot 才能私訊他
+ * - @All 不會被記錄(LINE 不提供全體成員名單給一般 Bot)
  */
 
 'use strict';
@@ -22,7 +28,7 @@ const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
 
-// ====== 設定（從環境變數讀取）======
+// ====== 設定(從環境變數讀取)======
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -33,7 +39,7 @@ if (!config.channelAccessToken || !config.channelSecret) {
   process.exit(1);
 }
 
-// 每天幾點寄送備份（台灣時間），預設 23:55
+// 每天幾點寄送備份(台灣時間),預設 23:55
 const DAILY_CRON = process.env.DAILY_CRON || '55 23 * * *';
 const TIMEZONE = 'Asia/Taipei';
 
@@ -41,14 +47,20 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-// ====== 簡易資料儲存（JSON 檔，重開機不會遺失）======
+// ====== 簡易資料儲存(JSON 檔)======
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 function loadData() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!d.mentions) d.mentions = {};
+    if (!d.settings) d.settings = {};
+    return d;
   } catch (e) {
-    return { mentions: {} }; // { userId: [ {groupName, senderName, text, time} ] }
+    return {
+      mentions: {}, // { userId: [ {groupName, senderName, text, time} ] }
+      settings: {}, // { userId: 'instant' | 'daily' }
+    };
   }
 }
 
@@ -57,6 +69,10 @@ function saveData(data) {
 }
 
 let db = loadData();
+
+function getUserMode(userId) {
+  return db.settings[userId] === 'instant' ? 'instant' : 'daily'; // 預設每日
+}
 
 // ====== 小工具 ======
 async function getSenderName(source) {
@@ -68,7 +84,7 @@ async function getSenderName(source) {
     const p = await client.getProfile(source.userId);
     return p.displayName;
   } catch (e) {
-    return '（未知成員）';
+    return '(未知成員)';
   }
 }
 
@@ -97,9 +113,8 @@ function todayTaipeiDate() {
 }
 
 // ====== 產生「聊天截圖樣式」的 Flex Message ======
-function buildBackupFlex(records) {
-  // 一則泡泡最多放 15 筆，太多會超過 LINE 限制
-  const items = records.slice(0, 15).map((r) => ({
+function recordBubbleBox(r) {
+  return {
     type: 'box',
     layout: 'vertical',
     backgroundColor: '#FFFFFF',
@@ -123,17 +138,20 @@ function buildBackupFlex(records) {
       },
       {
         type: 'text',
-        text: `📌 來自：${r.groupName}`,
+        text: `📌 來自:${r.groupName}`,
         size: 'xxs',
         color: '#AAAAAA',
         margin: 'sm',
       },
     ],
-  }));
+  };
+}
 
+function buildFlex(title, subtitle, records) {
+  const items = records.slice(0, 15).map(recordBubbleBox);
   return {
     type: 'flex',
-    altText: `📋 今日被 Tag 訊息備份（${records.length} 則）`,
+    altText: title,
     contents: {
       type: 'bubble',
       size: 'giga',
@@ -143,20 +161,8 @@ function buildBackupFlex(records) {
         backgroundColor: '#8CABD9', // 仿 LINE 聊天室背景色
         paddingAll: '14px',
         contents: [
-          {
-            type: 'text',
-            text: `📋 ${todayTaipeiDate()} 被 Tag 訊息備份`,
-            weight: 'bold',
-            size: 'md',
-            color: '#FFFFFF',
-          },
-          {
-            type: 'text',
-            text: `共 ${records.length} 則${records.length > 15 ? '（僅顯示前 15 則）' : ''}`,
-            size: 'xs',
-            color: '#EEF3FA',
-            margin: 'sm',
-          },
+          { type: 'text', text: title, weight: 'bold', size: 'md', color: '#FFFFFF' },
+          { type: 'text', text: subtitle, size: 'xs', color: '#EEF3FA', margin: 'sm' },
           ...items,
         ],
       },
@@ -164,44 +170,122 @@ function buildBackupFlex(records) {
   };
 }
 
-// ====== 每日寄送備份 ======
+function buildDailyFlex(records) {
+  const sub = `共 ${records.length} 則${records.length > 15 ? '(僅顯示前 15 則)' : ''}`;
+  return buildFlex(`📋 ${todayTaipeiDate()} 被 Tag 訊息備份`, sub, records);
+}
+
+function buildInstantFlex(record) {
+  return buildFlex('🔔 你剛剛被 Tag 了', '即時備份如下', [record]);
+}
+
+// ====== 寄送 ======
+async function pushToUser(userId, flexMessage) {
+  try {
+    await client.pushMessage({ to: userId, messages: [flexMessage] });
+    return true;
+  } catch (e) {
+    console.error(`⚠️ 無法私訊 ${userId}:${e.message}(他可能還沒加 Bot 好友)`);
+    return false;
+  }
+}
+
 async function sendDailyBackups() {
   const userIds = Object.keys(db.mentions);
-  console.log(`⏰ 開始寄送每日備份，共 ${userIds.length} 位使用者`);
+  console.log(`⏰ 開始寄送每日備份,共 ${userIds.length} 位使用者`);
 
   for (const userId of userIds) {
     const records = db.mentions[userId];
     if (!records || records.length === 0) continue;
-
-    try {
-      await client.pushMessage({
-        to: userId,
-        messages: [buildBackupFlex(records)],
-      });
-      console.log(`✅ 已寄給 ${userId}（${records.length} 則）`);
-    } catch (e) {
-      // 最常見原因：對方沒有加 Bot 好友，無法私訊
-      console.error(`⚠️ 無法寄給 ${userId}：${e.message}（他可能還沒加 Bot 好友）`);
-    }
+    const ok = await pushToUser(userId, buildDailyFlex(records));
+    if (ok) console.log(`✅ 已寄給 ${userId}(${records.length} 則)`);
   }
 
-  // 寄完清空當天資料
-  db = { mentions: {} };
+  db.mentions = {}; // 寄完清空當天資料(設定保留)
   saveData(db);
+}
+
+// 記錄或即時轉傳一筆被 tag 的訊息
+async function handleMentionRecord(userId, record) {
+  if (getUserMode(userId) === 'instant') {
+    await pushToUser(userId, buildInstantFlex(record));
+    console.log(`⚡ 已即時轉傳給 ${userId}`);
+  } else {
+    if (!db.mentions[userId]) db.mentions[userId] = [];
+    db.mentions[userId].push(record);
+    saveData(db);
+    console.log(`📝 已記錄一則(每日模式)給 ${userId}`);
+  }
+}
+
+// ====== 使用者指令 ======
+async function replyText(replyToken, text) {
+  try {
+    await client.replyMessage({ replyToken, messages: [{ type: 'text', text }] });
+  } catch (e) {
+    console.error(`⚠️ 回覆失敗:${e.message}`);
+  }
+}
+
+function normalizeCmd(text) {
+  // 全形驚嘆號轉半形,方便比對
+  return text.replace(/！/g, '!').trim();
+}
+
+async function handleCommand(event) {
+  const { source, message, replyToken } = event;
+  const cmd = normalizeCmd(message.text);
+  const userId = source.userId;
+
+  if (cmd === '!即時') {
+    db.settings[userId] = 'instant';
+    saveData(db);
+    await replyText(replyToken, '⚡ 已切換為【即時模式】\n之後你在群組被 tag,會馬上收到備份卡片。\n\n輸入 !每日 可切換回每日彙整。');
+    return true;
+  }
+
+  if (cmd === '!每日') {
+    db.settings[userId] = 'daily';
+    saveData(db);
+    await replyText(replyToken, '📋 已切換為【每日模式】\n每天 23:55 會把你當天被 tag 的訊息一次寄給你。\n\n輸入 !即時 可切換成即時轉傳。');
+    return true;
+  }
+
+  if (cmd === '!設定') {
+    const mode = getUserMode(userId) === 'instant' ? '⚡ 即時模式' : '📋 每日模式(預設)';
+    const pending = (db.mentions[userId] || []).length;
+    await replyText(replyToken, `你目前的備份模式:${mode}\n今日已累積待寄:${pending} 則\n\n可用指令:\n!即時 → 被 tag 馬上轉傳\n!每日 → 每天彙整一次\n!測試 內容 → 模擬被 tag\n!備份 → 立刻寄出累積的備份`);
+    return true;
+  }
+
+  if (cmd === '!備份') {
+    await sendDailyBackups();
+    return true;
+  }
+
+  if (cmd.startsWith('!測試')) {
+    const senderName = await getSenderName(source);
+    const groupName = source.type === 'group' ? await getGroupName(source.groupId) : '(一對一測試)';
+    const record = { groupName, senderName, text: message.text, time: nowTaipeiString() };
+    await handleMentionRecord(userId, record);
+    if (getUserMode(userId) === 'daily') {
+      await replyText(replyToken, '✅ 已記錄(每日模式)。輸入 !備份 可立刻收到卡片,或等每晚自動寄送。');
+    }
+    return true;
+  }
+
+  return false;
 }
 
 // ====== Webhook 處理 ======
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
-  const { source, message } = event;
-  const text = message.text.trim();
+  // 先看是不是指令
+  const isCmd = await handleCommand(event);
+  if (isCmd) return;
 
-  // 測試指令：在群組輸入 !備份 可立刻手動寄送（方便測試）
-  if (text === '!備份' || text === '！備份') {
-    await sendDailyBackups();
-    return;
-  }
+  const { source, message } = event;
 
   // 只處理群組訊息、且有 @mention 的訊息
   if (source.type !== 'group') return;
@@ -213,25 +297,21 @@ async function handleEvent(event) {
   const time = nowTaipeiString();
 
   for (const m of mentionees) {
-    // @All 沒有 userId，略過
+    // @All 沒有 userId,略過
     if (!m.userId) continue;
-
-    if (!db.mentions[m.userId]) db.mentions[m.userId] = [];
-    db.mentions[m.userId].push({
+    await handleMentionRecord(m.userId, {
       groupName,
       senderName,
       text: message.text,
       time,
     });
   }
-  saveData(db);
-  console.log(`📝 已記錄一則被 tag 訊息（tag 了 ${mentionees.length} 人）`);
 }
 
 // ====== 啟動伺服器 ======
 const app = express();
 
-app.get('/', (req, res) => res.send('LINE Mention Backup Bot is running ✅'));
+app.get('/', (req, res) => res.send('LINE Mention Backup Bot v2 is running ✅'));
 
 app.post('/webhook', line.middleware({ channelSecret: config.channelSecret }), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
@@ -242,11 +322,11 @@ app.post('/webhook', line.middleware({ channelSecret: config.channelSecret }), (
     });
 });
 
-// 每天定時寄送
+// 每天定時寄送(每日模式的使用者)
 cron.schedule(DAILY_CRON, sendDailyBackups, { timezone: TIMEZONE });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`🚀 Bot 已啟動，port ${port}`);
-  console.log(`⏰ 每日備份時間（台灣時間）：${DAILY_CRON}`);
+  console.log(`🚀 Bot v2 已啟動,port ${port}`);
+  console.log(`⏰ 每日備份時間(台灣時間):${DAILY_CRON}`);
 });
