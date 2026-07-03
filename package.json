@@ -1,0 +1,17 @@
+{
+  "name": "line-mention-backup-bot",
+  "version": "1.0.0",
+  "description": "每天自動把群組中被 @tag 的訊息，整理成聊天截圖樣式，私訊給被 tag 的人當備份",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.5.0",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
