@@ -1,5 +1,5 @@
 /**
- * LINE 群組「被 Tag 訊息」備份 Bot v5.2(整合完整版)
+ * LINE 群組「被 Tag 訊息」備份 Bot v5.3(整合完整版)
  * =================================================
  * 功能:
  *  1. Bot 待在 LINE 群組裡,即時記錄所有「@某人」與「@All」的訊息
@@ -392,9 +392,40 @@ function recordMention(userId, record) {
 }
 
 // ====== 指令 ======
-async function replyText(replyToken, text) {
+// ====== 版本公告(搭在「回覆」上,不消耗推播額度)======
+const APP_VERSION = 'v5.3';
+const UPDATE_NOTES = [
+  '📣 Bot 已更新到 v5.3,重點如下:',
+  '・寄送時間改為每天晚上 21:00',
+  '・新增 !額度 查看本月推播用量',
+  '・新增 !停用 / !啟用',
+  '・新增 !說明 隨時查看完整指令',
+  '・額度快用完時會自動降級,不會再無聲停擺',
+].join('\n');
+
+// 這個人是否已看過本版公告
+function hasSeenNotice(userId) {
+  const s = db.settings[userId] || {};
+  return s.seenVersion === APP_VERSION;
+}
+
+function markNoticeSeen(userId) {
+  setUserSetting(userId, { seenVersion: APP_VERSION });
+}
+
+async function replyText2(replyToken, userId, text) {
+  return replyText(replyToken, text, userId);
+}
+
+async function replyText(replyToken, text, userId) {
+  let body = text;
+  // 若這個人還沒看過本版更新公告,順便搭便車告知(回覆不佔額度)
+  if (userId && !hasSeenNotice(userId)) {
+    body = `${text}\n\n────────────\n${UPDATE_NOTES}`;
+    markNoticeSeen(userId);
+  }
   try {
-    await client.replyMessage({ replyToken, messages: [{ type: 'text', text }] });
+    await client.replyMessage({ replyToken, messages: [{ type: 'text', text: body }] });
   } catch (e) {
     console.error(`⚠️ 回覆失敗:${e.message}`);
   }
@@ -413,49 +444,66 @@ async function handleCommand(event) {
   if (cmd === '!合併' || cmd === '!即時') {
     setUserSetting(userId, { mode: 'buffer', off: false });
     const s = getUserSetting(userId);
-    await replyText(replyToken, `⚡ 已切換為【合併模式】\n被 tag 的訊息會先累積,每 ${s.bufferMin} 分鐘合併成一張卡片寄給你。\n\n這樣一次爆多則只花 1 則額度,比舊的即時模式省很多。\n輸入「!間隔 30」可改成 30 分鐘。`);
+    await replyText2(replyToken, userId, `⚡ 已切換為【合併模式】\n被 tag 的訊息會先累積,每 ${s.bufferMin} 分鐘合併成一張卡片寄給你。\n\n這樣一次爆多則只花 1 則額度,比舊的即時模式省很多。\n輸入「!間隔 30」可改成 30 分鐘。`);
     return true;
   }
 
   if (cmd === '!每日') {
     setUserSetting(userId, { mode: 'daily', off: false });
     const extraNote = EXTRA_CRON ? `\n(額度充足時,另外在 ${EXTRA_TIME_TEXT} 加寄一次)` : '';
-    await replyText(replyToken, `📋 已切換為【每日模式】(最省額度)\n每天 ${DAILY_TIME_TEXT} 一次寄出當天所有被 tag 的訊息。${extraNote}`);
+    await replyText2(replyToken, userId, `📋 已切換為【每日模式】(最省額度)\n每天 ${DAILY_TIME_TEXT} 一次寄出當天所有被 tag 的訊息。${extraNote}`);
     return true;
   }
 
   if (cmd.startsWith('!間隔')) {
     const n = parseInt(cmd.replace('!間隔', '').trim(), 10);
     if (!Number.isFinite(n) || n < 5 || n > 240) {
-      await replyText(replyToken, '請輸入 5 到 240 之間的分鐘數,例如:!間隔 30');
+      await replyText2(replyToken, userId, '請輸入 5 到 240 之間的分鐘數,例如:!間隔 30');
       return true;
     }
     setUserSetting(userId, { bufferMin: n, mode: 'buffer', off: false });
-    await replyText(replyToken, `⏱️ 合併間隔已設為 ${n} 分鐘(並自動切換為合併模式)。\n間隔越長越省額度。`);
+    await replyText2(replyToken, userId, `⏱️ 合併間隔已設為 ${n} 分鐘(並自動切換為合併模式)。\n間隔越長越省額度。`);
     return true;
   }
 
   if (cmd === '!全體開') {
     setUserSetting(userId, { all: true });
-    await replyText(replyToken, '📢 已開啟【@All 備份】');
+    await replyText2(replyToken, userId, '📢 已開啟【@All 備份】');
     return true;
   }
 
   if (cmd === '!全體關') {
     setUserSetting(userId, { all: false });
-    await replyText(replyToken, '🔕 已關閉【@All 備份】\n(這會替整個群組省下不少額度)');
+    await replyText2(replyToken, userId, '🔕 已關閉【@All 備份】\n(這會替整個群組省下不少額度)');
     return true;
   }
 
   if (cmd === '!停用') {
     setUserSetting(userId, { off: true });
-    await replyText(replyToken, '⛔ 已停用備份,你不會再收到任何卡片。\n輸入 !啟用 可恢復。');
+    await replyText2(replyToken, userId, '⛔ 已停用備份,你不會再收到任何卡片。\n輸入 !啟用 可恢復。');
     return true;
   }
 
   if (cmd === '!啟用') {
     setUserSetting(userId, { off: false });
-    await replyText(replyToken, '✅ 已恢復備份功能。');
+    await replyText2(replyToken, userId, '✅ 已恢復備份功能。');
+    return true;
+  }
+
+  if (cmd === '!說明' || cmd === '!指令' || cmd === '!help' || cmd === '!幫助') {
+    await replyText2(replyToken, userId,
+      `📖 備份 Bot 使用說明(${APP_VERSION})\n\n` +
+      `【它做什麼】\n你在群組被 @ 到的訊息,會在每天 ${DAILY_TIME_TEXT} 整理成一張卡片,私訊到這裡當備份。\n\n` +
+      `【模式】\n!每日 → 每天 ${DAILY_TIME_TEXT} 寄一次(最省額度,建議)\n!合併 → 累積 N 分鐘就合併寄一次(較耗額度)\n!間隔 30 → 設定合併間隔分鐘數\n\n` +
+      `【開關】\n!全體開 / !全體關 → 是否接收 @All 公告\n!停用 / !啟用 → 完全不收 / 恢復\n\n` +
+      `【查詢】\n!設定 → 我目前的設定\n!額度 → 本月推播用量\n!說明 → 這份說明\n\n` +
+      `【測試】\n!測試 內容 → 模擬被 tag(LINE 不允許 @ 自己)\n!備份 → 立刻寄出累積的訊息\n\n` +
+      `【注意】\n・沒加 Bot 好友的人收不到備份\n・Bot 只記錄它加入群組之後的訊息\n・每月推播額度有限,請盡量使用 !每日`);
+    return true;
+  }
+
+  if (cmd === '!更新' || cmd === '!版本') {
+    await replyText2(replyToken, userId, `目前版本:${APP_VERSION}\n\n${UPDATE_NOTES}`);
     return true;
   }
 
@@ -468,7 +516,7 @@ async function handleCommand(event) {
           ? `\n加班場寄送:🟢 運作中(一天兩次)`
           : `\n加班場寄送:🟡 已自動停辦(降級為一天一次)`)
       : '';
-    await replyText(replyToken, `📊 本月推播額度(${q.month})\n已使用:${q.used} / ${MONTHLY_PUSH_LIMIT}\n剩餘:${left} 則\n狀態:${bar}${extraLine}\n\n※ 每月 1 號自動重置\n※ 指令回覆不佔額度,只有備份卡片會佔`);
+    await replyText2(replyToken, userId, `📊 本月推播額度(${q.month})\n已使用:${q.used} / ${MONTHLY_PUSH_LIMIT}\n剩餘:${left} 則\n狀態:${bar}${extraLine}\n\n※ 每月 1 號自動重置\n※ 指令回覆不佔額度,只有備份卡片會佔`);
     return true;
   }
 
@@ -478,7 +526,7 @@ async function handleCommand(event) {
     const allState = s.all ? '📢 開啟' : '🔕 關閉';
     const pending = (db.mentions[userId] || []).length;
     const storage = USE_CLOUD ? '☁️ 雲端' : '💾 本機(重啟會遺失)';
-    await replyText(replyToken,
+    await replyText2(replyToken, userId,
       `你目前的設定:\n備份模式:${mode}\n@All 備份:${allState}\n待寄訊息:${pending} 則\n資料儲存:${storage}\n本月額度:${getQuota().used}/${MONTHLY_PUSH_LIMIT}\n\n指令:\n!每日 / !合併 → 切換模式\n!間隔 30 → 合併間隔(分鐘)\n!全體開 / !全體關\n!停用 / !啟用\n!額度 → 查看本月用量\n!備份 → 立刻寄出待寄訊息`);
     return true;
   }
@@ -499,7 +547,13 @@ async function handleCommand(event) {
     const hint = s.off ? '你目前是停用狀態,不會收到卡片。' :
       s.mode === 'buffer' ? `已記錄,將在 ${s.bufferMin} 分鐘內合併寄出。想立刻看結果請輸入 !備份。` :
       '已記錄(每日模式)。輸入 !備份 可立刻收到卡片。';
-    await replyText(replyToken, `✅ ${hint}`);
+    await replyText2(replyToken, userId, `✅ ${hint}`);
+    return true;
+  }
+
+  // 一對一聊天室中,打了不認識的 ! 指令 → 提示可用指令(回覆不佔額度)
+  if (source.type === 'user') {
+    await replyText2(replyToken, userId, `❓ 沒有這個指令:${cmd}\n\n輸入 !說明 可查看完整指令清單。`);
     return true;
   }
 
@@ -557,7 +611,7 @@ const app = express();
 
 app.get('/', (req, res) => {
   const q = getQuota();
-  res.send(`LINE Mention Backup Bot v5.2 is running ✅ (storage: ${USE_CLOUD ? 'cloud' : 'local'}, quota: ${q.used}/${MONTHLY_PUSH_LIMIT})`);
+  res.send(`LINE Mention Backup Bot v5.3 is running ✅ (storage: ${USE_CLOUD ? 'cloud' : 'local'}, quota: ${q.used}/${MONTHLY_PUSH_LIMIT})`);
 });
 
 app.post('/webhook', line.middleware({ channelSecret: config.channelSecret }), (req, res) => {
@@ -576,7 +630,7 @@ const port = process.env.PORT || 3000;
 
 loadData().then(() => {
   app.listen(port, () => {
-    console.log(`🚀 Bot v5.2 已啟動,port ${port}`);
+    console.log(`🚀 Bot v5.3 已啟動,port ${port}`);
     console.log(`💽 儲存:${USE_CLOUD ? '☁️ JSONBin' : '💾 本機'}`);
     console.log(`📊 每月推播上限:${MONTHLY_PUSH_LIMIT}(保留 ${QUOTA_RESERVE} 則給每日彙整)`);
     console.log(`⏱️ 預設合併間隔:${DEFAULT_BUFFER_MIN} 分鐘`);
