@@ -1,28 +1,41 @@
 /**
- * LINE 群組「被 Tag 訊息」備份 Bot v4
- * ------------------------------------------------
- * v4 重點更新:
- * ★ 資料改存雲端(JSONBin.io),Render 重啟/睡醒/重新部署都不會遺失
- *   → 個人設定(即時/每日、@All開關)、群組成員名單、當日累積 通通保得住
- * ★ 未設定 JSONBin 時自動退回本機檔案模式(功能照舊,但重啟會遺失)
+ * LINE 群組「被 Tag 訊息」備份 Bot v5.2(整合完整版)
+ * =================================================
+ * 功能:
+ *  1. Bot 待在 LINE 群組裡,即時記錄所有「@某人」與「@All」的訊息
+ *  2. 定時把「你被 tag 的訊息」做成聊天截圖樣式的卡片,私訊給本人當備份
+ *  3. 資料存在雲端(JSONBin),伺服器重啟不會遺失設定與名單
+ *  4. 內建 LINE 推播額度守門員,額度吃緊自動降級,不會無聲無息停止服務
  *
- * 需要的環境變數:
- *   LINE_CHANNEL_ACCESS_TOKEN  (必填)
- *   LINE_CHANNEL_SECRET        (必填)
- *   JSONBIN_BIN_ID             (建議,雲端儲存用)
- *   JSONBIN_API_KEY            (建議,雲端儲存用,JSONBin 的 X-Master-Key)
- *   DAILY_CRON                 (選填,預設 55 23 * * *)
+ * 環境變數:
+ *   LINE_CHANNEL_ACCESS_TOKEN  必填  LINE Developers → Messaging API 分頁
+ *   LINE_CHANNEL_SECRET        必填  LINE Developers → Basic settings 分頁
+ *   JSONBIN_BIN_ID             建議  jsonbin.io 的 Bin ID(雲端儲存)
+ *   JSONBIN_API_KEY            建議  jsonbin.io 的 Master Key
+ *   DAILY_CRON                 選填  主要寄送時間,預設 0 21 * * *(晚上 9:00)
+ *   EXTRA_CRON                 選填  加班場時間,例如 0 11 * * *(額度不足會自動停辦)
+ *   EXTRA_MIN_REMAINING        選填  剩餘額度低於此值就停辦加班場,預設 60
+ *   MONTHLY_PUSH_LIMIT         選填  LINE 方案每月推播上限,預設 200
+ *   QUOTA_RESERVE              選填  保留給主要彙整的額度,預設 20
+ *   BUFFER_MINUTES             選填  合併模式預設間隔分鐘,預設 60
  *
- * 使用者指令:
- *    !即時 / !每日      → 切換備份模式(預設每日)
- *    !全體開 / !全體關   → @All 備份開關(預設開)
- *    !設定              → 查看目前設定
- *    !測試 xxx          → 模擬「自己被 tag」
- *    !備份              → 立刻寄出累積的每日備份
+ * 使用者指令(在「自己和 Bot 的一對一聊天室」輸入):
+ *   !每日            每天固定時間彙整寄出一張卡片(最省額度,預設)
+ *   !合併 / !即時     訊息累積 N 分鐘後合併成一張寄出(較耗額度)
+ *   !間隔 30         設定自己的合併間隔為 30 分鐘(5~240)
+ *   !全體開 / !全體關  是否接收 @All 的備份
+ *   !停用 / !啟用     完全不收 / 恢復接收
+ *   !設定            查看自己目前的設定
+ *   !額度            查看本月推播用量
+ *   !測試 內容        模擬「自己被 tag」(LINE 不允許 @ 自己,測試用)
+ *   !備份            立刻寄出目前累積的訊息
  *
- * 注意(LINE 官方限制):
- * - 收備份的人必須先加 Bot 好友
- * - @All 只會傳給「Bot 見過的成員」;發話者本人不會收到自己發的 @All
+ * LINE 官方限制(無法繞過):
+ *   - 收備份的人必須先加 Bot 好友,否則 Bot 無法私訊他
+ *   - Bot 只能記錄「加入群組之後」的訊息,無法讀取歷史對話
+ *   - Bot 無法真的截圖,改用 Flex 卡片繪製對話樣式
+ *   - @All 只能傳給「Bot 見過的成員」(發過言、被 tag 過、加入時被記錄到的人)
+ *   - 發 @All 的人自己不會收到該則備份
  */
 
 'use strict';
@@ -33,7 +46,7 @@ const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
 
-// ====== 設定(從環境變數讀取)======
+// ====== 設定 ======
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -48,21 +61,28 @@ const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID || '';
 const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY || '';
 const USE_CLOUD = Boolean(JSONBIN_BIN_ID && JSONBIN_API_KEY);
 
-const DAILY_CRON = process.env.DAILY_CRON || '55 23 * * *';
+const MONTHLY_PUSH_LIMIT = parseInt(process.env.MONTHLY_PUSH_LIMIT || '200', 10);
+const QUOTA_RESERVE = parseInt(process.env.QUOTA_RESERVE || '20', 10);
+const DEFAULT_BUFFER_MIN = parseInt(process.env.BUFFER_MINUTES || '60', 10);
+const DAILY_CRON = process.env.DAILY_CRON || '0 21 * * *';
+// 「加班場」寄送時間(選填)。額度充足時才會執行,額度吃緊會自動略過 → 自動降級成一天一次
+const EXTRA_CRON = process.env.EXTRA_CRON || '';
+const EXTRA_MIN_REMAINING = parseInt(process.env.EXTRA_MIN_REMAINING || '60', 10);
 const TIMEZONE = 'Asia/Taipei';
 
 const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-// ====== 資料儲存(雲端 JSONBin,或本機檔案備援)======
+// ====== 資料儲存 ======
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 function emptyDb() {
   return {
-    mentions: {}, // { userId: [ {groupName, senderName, text, time, isAll} ] }
-    settings: {}, // { userId: { mode: 'instant'|'daily', all: true|false } }
+    mentions: {}, // { userId: [ {groupName, senderName, text, time, ts, isAll} ] }
+    settings: {}, // { userId: { mode, all, bufferMin, off } }
     members: {},  // { groupId: { userId: true } }
+    quota: { month: '', used: 0 },
   };
 }
 
@@ -74,29 +94,26 @@ async function loadData() {
       const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
         headers: { 'X-Master-Key': JSONBIN_API_KEY },
       });
-      if (!res.ok) throw new Error(`JSONBin 讀取失敗:HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      const d = json.record || {};
-      db = { ...emptyDb(), ...d };
+      db = { ...emptyDb(), ...(json.record || {}) };
+      if (!db.quota) db.quota = { month: '', used: 0 };
       console.log('☁️ 已從 JSONBin 載入雲端資料');
       return;
     } catch (e) {
-      console.error(`⚠️ 雲端載入失敗,改用空資料啟動:${e.message}`);
+      console.error(`⚠️ 雲端載入失敗,以空資料啟動:${e.message}`);
       db = emptyDb();
       return;
     }
   }
-  // 本機備援模式
   try {
     db = { ...emptyDb(), ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) };
-    console.log('💾 已從本機檔案載入資料(注意:Render 重啟會遺失)');
+    console.log('💾 已從本機檔案載入資料(重啟會遺失)');
   } catch (e) {
     db = emptyDb();
   }
 }
 
-// 存檔:雲端模式用「防抖」— 資料變動後 5 秒才真正上傳一次,
-// 避免群組訊息一多就狂打 JSONBin 浪費免費額度
 let saveTimer = null;
 let saving = false;
 let dirtyAgain = false;
@@ -107,14 +124,10 @@ async function uploadToCloud() {
   try {
     const res = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
       method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Master-Key': JSONBIN_API_KEY,
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_API_KEY },
       body: JSON.stringify(db),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    console.log('☁️ 已存檔到 JSONBin');
   } catch (e) {
     console.error(`⚠️ 雲端存檔失敗:${e.message}`);
   } finally {
@@ -132,16 +145,88 @@ function scheduleSave() {
   saveTimer = setTimeout(uploadToCloud, 5000);
 }
 
-function saveData() {
-  scheduleSave();
+function saveData() { scheduleSave(); }
+
+// ====== 時間工具 ======
+function nowTaipeiString() {
+  return new Date().toLocaleString('zh-TW', {
+    timeZone: TIMEZONE, hour12: false,
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function todayTaipeiDate() {
+  return new Date().toLocaleDateString('zh-TW', { timeZone: TIMEZONE });
+}
+
+function currentMonthKey() {
+  // 以台灣時間判斷月份,例如 2026-07
+  const s = new Date().toLocaleDateString('en-CA', { timeZone: TIMEZONE }); // YYYY-MM-DD
+  return s.slice(0, 7);
+}
+
+// 把 cron 字串轉成人看得懂的時間,例如 "0 21 * * *" → "21:00"
+function cronToHuman(expr) {
+  if (!expr) return '(未設定)';
+  const parts = String(expr).trim().split(/\s+/);
+  if (parts.length < 2) return expr;
+  const min = parts[0];
+  const hours = parts[1];
+  if (!/^\d+$/.test(min)) return expr;
+  const mm = String(min).padStart(2, '0');
+  const list = hours.split(',');
+  if (!list.every((h) => /^\d+$/.test(h))) return expr;
+  return list.map((h) => `${String(h).padStart(2, '0')}:${mm}`).join('、');
+}
+
+const DAILY_TIME_TEXT = cronToHuman(DAILY_CRON);
+const EXTRA_TIME_TEXT = cronToHuman(EXTRA_CRON);
+
+// ====== 額度守門員 ======
+function getQuota() {
+  const m = currentMonthKey();
+  if (db.quota.month !== m) {
+    db.quota = { month: m, used: 0 }; // 跨月自動重置
+    saveData();
+    console.log(`🗓️ 進入新月份 ${m},推播額度已重置`);
+  }
+  return db.quota;
+}
+
+function quotaRemaining() {
+  return MONTHLY_PUSH_LIMIT - getQuota().used;
+}
+
+// kind: 'buffer'(合併寄送) | 'daily'(主要彙整) | 'extra'(加班場彙整)
+function canPush(kind) {
+  const used = getQuota().used;
+  if (kind === 'daily') return used < MONTHLY_PUSH_LIMIT;               // 主要彙整:用到最後一刻
+  if (kind === 'extra') return quotaRemainingRaw() > EXTRA_MIN_REMAINING; // 加班場:額度吃緊就停辦
+  return used < MONTHLY_PUSH_LIMIT - QUOTA_RESERVE;                     // 合併模式:先讓路
+}
+
+function quotaRemainingRaw() {
+  return MONTHLY_PUSH_LIMIT - getQuota().used;
+}
+
+// 加班場目前是否還在運作(額度充足)
+function extraActive() {
+  return Boolean(EXTRA_CRON) && quotaRemainingRaw() > EXTRA_MIN_REMAINING;
+}
+
+function countPush() {
+  getQuota().used += 1;
+  saveData();
 }
 
 // ====== 使用者設定 ======
 function getUserSetting(userId) {
   const s = db.settings[userId] || {};
   return {
-    mode: s.mode === 'instant' ? 'instant' : 'daily',
+    mode: s.mode === 'buffer' ? 'buffer' : 'daily', // 預設每日(最省)
     all: s.all !== false,
+    bufferMin: Number.isFinite(s.bufferMin) ? s.bufferMin : DEFAULT_BUFFER_MIN,
+    off: s.off === true,
   };
 }
 
@@ -159,7 +244,7 @@ function rememberMember(groupId, userId) {
   }
 }
 
-// ====== 小工具 ======
+// ====== LINE 資料 ======
 async function getSenderName(source) {
   try {
     if (source.type === 'group') {
@@ -182,36 +267,16 @@ async function getGroupName(groupId) {
   }
 }
 
-function nowTaipeiString() {
-  return new Date().toLocaleString('zh-TW', {
-    timeZone: TIMEZONE,
-    hour12: false,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
-function todayTaipeiDate() {
-  return new Date().toLocaleDateString('zh-TW', { timeZone: TIMEZONE });
-}
-
 // ====== Flex Message(聊天截圖樣式)======
 function recordBubbleBox(r) {
   return {
-    type: 'box',
-    layout: 'vertical',
-    backgroundColor: '#FFFFFF',
-    cornerRadius: '12px',
-    paddingAll: '10px',
-    margin: 'md',
+    type: 'box', layout: 'vertical', backgroundColor: '#FFFFFF',
+    cornerRadius: '12px', paddingAll: '10px', margin: 'md',
     contents: [
       {
         type: 'text',
         text: `${r.senderName}　${r.time}${r.isAll ? '　📢@全體' : ''}`,
-        size: 'xs',
-        color: '#888888',
+        size: 'xs', color: '#888888',
       },
       { type: 'text', text: r.text, size: 'sm', color: '#111111', wrap: true, margin: 'sm' },
       { type: 'text', text: `📌 來自:${r.groupName}`, size: 'xxs', color: '#AAAAAA', margin: 'sm' },
@@ -225,13 +290,9 @@ function buildFlex(title, subtitle, records) {
     type: 'flex',
     altText: title,
     contents: {
-      type: 'bubble',
-      size: 'giga',
+      type: 'bubble', size: 'giga',
       body: {
-        type: 'box',
-        layout: 'vertical',
-        backgroundColor: '#8CABD9',
-        paddingAll: '14px',
+        type: 'box', layout: 'vertical', backgroundColor: '#8CABD9', paddingAll: '14px',
         contents: [
           { type: 'text', text: title, weight: 'bold', size: 'md', color: '#FFFFFF' },
           { type: 'text', text: subtitle, size: 'xs', color: '#EEF3FA', margin: 'sm' },
@@ -242,56 +303,95 @@ function buildFlex(title, subtitle, records) {
   };
 }
 
-function buildDailyFlex(records) {
-  const sub = `共 ${records.length} 則${records.length > 15 ? '(僅顯示前 15 則)' : ''}`;
-  return buildFlex(`📋 ${todayTaipeiDate()} 被 Tag 訊息備份`, sub, records);
+function subtitleOf(records) {
+  return `共 ${records.length} 則${records.length > 15 ? '(僅顯示前 15 則)' : ''}`;
 }
 
-function buildInstantFlex(record) {
-  const title = record.isAll ? '📢 群組發布了 @全體訊息' : '🔔 你剛剛被 Tag 了';
-  return buildFlex(title, '即時備份如下', [record]);
+function buildMergedFlex(records) {
+  return buildFlex(`🔔 你有 ${records.length} 則被 Tag 訊息`, `合併備份・${nowTaipeiString()}`, records);
+}
+
+function buildDailyFlex(records) {
+  return buildFlex(`📋 ${todayTaipeiDate()} 被 Tag 訊息備份`, subtitleOf(records), records);
 }
 
 // ====== 寄送 ======
 async function pushToUser(userId, flexMessage) {
   try {
     await client.pushMessage({ to: userId, messages: [flexMessage] });
+    countPush();
     return true;
   } catch (e) {
-    console.error(`⚠️ 無法私訊 ${userId}:${e.message}(他可能還沒加 Bot 好友)`);
+    console.error(`⚠️ 無法私訊 ${userId}:${e.message}`);
     return false;
   }
 }
 
-async function sendDailyBackups() {
-  const userIds = Object.keys(db.mentions);
-  console.log(`⏰ 開始寄送每日備份,共 ${userIds.length} 位使用者`);
-  for (const userId of userIds) {
+// 寄出某人累積的訊息(kind 決定額度門檻)
+async function flushUser(userId, kind) {
+  const records = db.mentions[userId];
+  if (!records || records.length === 0) return false;
+
+  if (!canPush(kind)) {
+    console.log(`🛑 額度守門員:略過 ${kind} 寄送(本月已用 ${getQuota().used}/${MONTHLY_PUSH_LIMIT})`);
+    return false; // 保留資料,等主要彙整或下個月
+  }
+
+  const flex = kind === 'buffer' ? buildMergedFlex(records) : buildDailyFlex(records);
+  const ok = await pushToUser(userId, flex);
+  delete db.mentions[userId]; // 不論成功與否都清空,避免無限累積
+  saveData();
+  if (ok) console.log(`✅ 已寄給 ${userId}(${records.length} 則,${kind})`);
+  return ok;
+}
+
+// 每分鐘檢查:合併模式的人時間到了就寄
+async function flushBuffers() {
+  const now = Date.now();
+  for (const userId of Object.keys(db.mentions)) {
+    const s = getUserSetting(userId);
+    if (s.mode !== 'buffer') continue;
     const records = db.mentions[userId];
     if (!records || records.length === 0) continue;
-    const ok = await pushToUser(userId, buildDailyFlex(records));
-    if (ok) console.log(`✅ 已寄給 ${userId}(${records.length} 則)`);
+    const firstTs = records[0].ts || now;
+    if (now - firstTs >= s.bufferMin * 60 * 1000) {
+      await flushUser(userId, 'buffer');
+    }
   }
-  db.mentions = {};
-  saveData();
 }
 
-async function handleMentionRecord(userId, record) {
+// 主要彙整(每天必寄)
+async function sendDailyBackups() {
+  console.log(`⏰ 主要彙整開始,本月已用額度 ${getQuota().used}/${MONTHLY_PUSH_LIMIT}`);
+  for (const userId of Object.keys(db.mentions)) {
+    await flushUser(userId, 'daily');
+  }
+}
+
+// 加班場彙整(額度充足才寄;吃緊時自動略過 = 降級成一天一次)
+async function sendExtraBackups() {
+  if (!extraActive()) {
+    console.log(`🛑 額度吃緊(剩 ${quotaRemainingRaw()} 則,門檻 ${EXTRA_MIN_REMAINING}),本次加班場略過,自動降級為一天一次`);
+    return;
+  }
+  console.log(`⏰ 加班場彙整開始,本月已用額度 ${getQuota().used}/${MONTHLY_PUSH_LIMIT}`);
+  for (const userId of Object.keys(db.mentions)) {
+    await flushUser(userId, 'extra');
+  }
+}
+
+// 收到一筆被 tag 的訊息 → 一律先進緩衝區
+function recordMention(userId, record) {
   const s = getUserSetting(userId);
-  if (record.isAll && !s.all) return;
-
-  if (s.mode === 'instant') {
-    await pushToUser(userId, buildInstantFlex(record));
-    console.log(`⚡ 已即時轉傳給 ${userId}${record.isAll ? '(@All)' : ''}`);
-  } else {
-    if (!db.mentions[userId]) db.mentions[userId] = [];
-    db.mentions[userId].push(record);
-    saveData();
-    console.log(`📝 已記錄一則(每日模式)給 ${userId}${record.isAll ? '(@All)' : ''}`);
-  }
+  if (s.off) return;                      // 這個人停用了
+  if (record.isAll && !s.all) return;     // 這個人關掉 @All
+  if (!db.mentions[userId]) db.mentions[userId] = [];
+  db.mentions[userId].push(record);
+  saveData();
+  console.log(`📝 已記錄給 ${userId}(${s.mode}${record.isAll ? '・@All' : ''})`);
 }
 
-// ====== 使用者指令 ======
+// ====== 指令 ======
 async function replyText(replyToken, text) {
   try {
     await client.replyMessage({ replyToken, messages: [{ type: 'text', text }] });
@@ -308,64 +408,105 @@ async function handleCommand(event) {
   const { source, message, replyToken } = event;
   const cmd = normalizeCmd(message.text);
   const userId = source.userId;
+  if (!cmd.startsWith('!')) return false;
 
-  if (cmd === '!即時') {
-    setUserSetting(userId, { mode: 'instant' });
-    await replyText(replyToken, '⚡ 已切換為【即時模式】\n之後被 tag 會馬上收到備份卡片。\n\n輸入 !每日 可切回每日彙整。');
+  if (cmd === '!合併' || cmd === '!即時') {
+    setUserSetting(userId, { mode: 'buffer', off: false });
+    const s = getUserSetting(userId);
+    await replyText(replyToken, `⚡ 已切換為【合併模式】\n被 tag 的訊息會先累積,每 ${s.bufferMin} 分鐘合併成一張卡片寄給你。\n\n這樣一次爆多則只花 1 則額度,比舊的即時模式省很多。\n輸入「!間隔 30」可改成 30 分鐘。`);
     return true;
   }
 
   if (cmd === '!每日') {
-    setUserSetting(userId, { mode: 'daily' });
-    await replyText(replyToken, '📋 已切換為【每日模式】\n每天 23:55 一次寄出當天備份。\n\n輸入 !即時 可切成即時轉傳。');
+    setUserSetting(userId, { mode: 'daily', off: false });
+    const extraNote = EXTRA_CRON ? `\n(額度充足時,另外在 ${EXTRA_TIME_TEXT} 加寄一次)` : '';
+    await replyText(replyToken, `📋 已切換為【每日模式】(最省額度)\n每天 ${DAILY_TIME_TEXT} 一次寄出當天所有被 tag 的訊息。${extraNote}`);
+    return true;
+  }
+
+  if (cmd.startsWith('!間隔')) {
+    const n = parseInt(cmd.replace('!間隔', '').trim(), 10);
+    if (!Number.isFinite(n) || n < 5 || n > 240) {
+      await replyText(replyToken, '請輸入 5 到 240 之間的分鐘數,例如:!間隔 30');
+      return true;
+    }
+    setUserSetting(userId, { bufferMin: n, mode: 'buffer', off: false });
+    await replyText(replyToken, `⏱️ 合併間隔已設為 ${n} 分鐘(並自動切換為合併模式)。\n間隔越長越省額度。`);
     return true;
   }
 
   if (cmd === '!全體開') {
     setUserSetting(userId, { all: true });
-    await replyText(replyToken, '📢 已開啟【@All 備份】\n群組有 @全體訊息時你也會收到備份。');
+    await replyText(replyToken, '📢 已開啟【@All 備份】');
     return true;
   }
 
   if (cmd === '!全體關') {
     setUserSetting(userId, { all: false });
-    await replyText(replyToken, '🔕 已關閉【@All 備份】\n只有點名你個人的訊息才會備份給你。');
+    await replyText(replyToken, '🔕 已關閉【@All 備份】\n(這會替整個群組省下不少額度)');
+    return true;
+  }
+
+  if (cmd === '!停用') {
+    setUserSetting(userId, { off: true });
+    await replyText(replyToken, '⛔ 已停用備份,你不會再收到任何卡片。\n輸入 !啟用 可恢復。');
+    return true;
+  }
+
+  if (cmd === '!啟用') {
+    setUserSetting(userId, { off: false });
+    await replyText(replyToken, '✅ 已恢復備份功能。');
+    return true;
+  }
+
+  if (cmd === '!額度') {
+    const q = getQuota();
+    const left = quotaRemaining();
+    const bar = left <= 0 ? '🔴 已用完' : left <= QUOTA_RESERVE ? '🟡 快用完(僅剩每日彙整)' : '🟢 充足';
+    const extraLine = EXTRA_CRON
+      ? (extraActive()
+          ? `\n加班場寄送:🟢 運作中(一天兩次)`
+          : `\n加班場寄送:🟡 已自動停辦(降級為一天一次)`)
+      : '';
+    await replyText(replyToken, `📊 本月推播額度(${q.month})\n已使用:${q.used} / ${MONTHLY_PUSH_LIMIT}\n剩餘:${left} 則\n狀態:${bar}${extraLine}\n\n※ 每月 1 號自動重置\n※ 指令回覆不佔額度,只有備份卡片會佔`);
     return true;
   }
 
   if (cmd === '!設定') {
     const s = getUserSetting(userId);
-    const mode = s.mode === 'instant' ? '⚡ 即時模式' : '📋 每日模式(預設)';
-    const allState = s.all ? '📢 開啟(預設)' : '🔕 關閉';
+    const mode = s.off ? '⛔ 已停用' : s.mode === 'buffer' ? `⚡ 合併模式(每 ${s.bufferMin} 分鐘)` : `📋 每日模式(${DAILY_TIME_TEXT} 寄出)`;
+    const allState = s.all ? '📢 開啟' : '🔕 關閉';
     const pending = (db.mentions[userId] || []).length;
-    const storage = USE_CLOUD ? '☁️ 雲端(重啟不遺失)' : '💾 本機(重啟會遺失)';
-    await replyText(
-      replyToken,
-      `你目前的設定:\n備份模式:${mode}\n@All 備份:${allState}\n今日已累積待寄:${pending} 則\n資料儲存:${storage}\n\n可用指令:\n!即時 / !每日 → 切換備份模式\n!全體開 / !全體關 → @All 備份開關\n!測試 內容 → 模擬被 tag\n!備份 → 立刻寄出累積的備份`
-    );
+    const storage = USE_CLOUD ? '☁️ 雲端' : '💾 本機(重啟會遺失)';
+    await replyText(replyToken,
+      `你目前的設定:\n備份模式:${mode}\n@All 備份:${allState}\n待寄訊息:${pending} 則\n資料儲存:${storage}\n本月額度:${getQuota().used}/${MONTHLY_PUSH_LIMIT}\n\n指令:\n!每日 / !合併 → 切換模式\n!間隔 30 → 合併間隔(分鐘)\n!全體開 / !全體關\n!停用 / !啟用\n!額度 → 查看本月用量\n!備份 → 立刻寄出待寄訊息`);
     return true;
   }
 
   if (cmd === '!備份') {
-    await sendDailyBackups();
+    await flushUser(userId, 'daily');
     return true;
   }
 
   if (cmd.startsWith('!測試')) {
     const senderName = await getSenderName(source);
     const groupName = source.type === 'group' ? await getGroupName(source.groupId) : '(一對一測試)';
-    const record = { groupName, senderName, text: message.text, time: nowTaipeiString(), isAll: false };
-    await handleMentionRecord(userId, record);
-    if (getUserSetting(userId).mode === 'daily') {
-      await replyText(replyToken, '✅ 已記錄(每日模式)。輸入 !備份 可立刻收到卡片。');
-    }
+    recordMention(userId, {
+      groupName, senderName, text: message.text,
+      time: nowTaipeiString(), ts: Date.now(), isAll: false,
+    });
+    const s = getUserSetting(userId);
+    const hint = s.off ? '你目前是停用狀態,不會收到卡片。' :
+      s.mode === 'buffer' ? `已記錄,將在 ${s.bufferMin} 分鐘內合併寄出。想立刻看結果請輸入 !備份。` :
+      '已記錄(每日模式)。輸入 !備份 可立刻收到卡片。';
+    await replyText(replyToken, `✅ ${hint}`);
     return true;
   }
 
   return false;
 }
 
-// ====== Webhook 處理 ======
+// ====== Webhook ======
 async function handleEvent(event) {
   if (event.type === 'memberJoined' && event.source.type === 'group') {
     for (const m of (event.joined && event.joined.members) || []) {
@@ -377,11 +518,9 @@ async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const { source, message } = event;
-
   if (source.type === 'group') rememberMember(source.groupId, source.userId);
 
-  const isCmd = await handleCommand(event);
-  if (isCmd) return;
+  if (await handleCommand(event)) return;
 
   if (source.type !== 'group') return;
   const mentionees = message.mention && message.mention.mentionees;
@@ -390,6 +529,7 @@ async function handleEvent(event) {
   const senderName = await getSenderName(source);
   const groupName = await getGroupName(source.groupId);
   const time = nowTaipeiString();
+  const ts = Date.now();
 
   const hasAll = mentionees.some((m) => m.type === 'all' || !m.userId);
 
@@ -398,9 +538,7 @@ async function handleEvent(event) {
     if (!m.userId) continue;
     personalIds.add(m.userId);
     rememberMember(source.groupId, m.userId);
-    await handleMentionRecord(m.userId, {
-      groupName, senderName, text: message.text, time, isAll: false,
-    });
+    recordMention(m.userId, { groupName, senderName, text: message.text, time, ts, isAll: false });
   }
 
   if (hasAll) {
@@ -409,9 +547,7 @@ async function handleEvent(event) {
     for (const uid of roster) {
       if (uid === source.userId) continue;
       if (personalIds.has(uid)) continue;
-      await handleMentionRecord(uid, {
-        groupName, senderName, text: message.text, time, isAll: true,
-      });
+      recordMention(uid, { groupName, senderName, text: message.text, time, ts, isAll: true });
     }
   }
 }
@@ -420,28 +556,31 @@ async function handleEvent(event) {
 const app = express();
 
 app.get('/', (req, res) => {
-  const storage = USE_CLOUD ? 'cloud' : 'local';
-  res.send(`LINE Mention Backup Bot v4 is running ✅ (storage: ${storage})`);
+  const q = getQuota();
+  res.send(`LINE Mention Backup Bot v5.2 is running ✅ (storage: ${USE_CLOUD ? 'cloud' : 'local'}, quota: ${q.used}/${MONTHLY_PUSH_LIMIT})`);
 });
 
 app.post('/webhook', line.middleware({ channelSecret: config.channelSecret }), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
     .then(() => res.status(200).end())
-    .catch((err) => {
-      console.error(err);
-      res.status(200).end();
-    });
+    .catch((err) => { console.error(err); res.status(200).end(); });
 });
 
-cron.schedule(DAILY_CRON, sendDailyBackups, { timezone: TIMEZONE });
+cron.schedule('* * * * *', flushBuffers, { timezone: TIMEZONE });      // 每分鐘檢查合併緩衝
+cron.schedule(DAILY_CRON, sendDailyBackups, { timezone: TIMEZONE });   // 主要彙整
+if (EXTRA_CRON) {
+  cron.schedule(EXTRA_CRON, sendExtraBackups, { timezone: TIMEZONE }); // 加班場彙整
+}
 
 const port = process.env.PORT || 3000;
 
-// 先載入雲端資料,再開始接收訊息
 loadData().then(() => {
   app.listen(port, () => {
-    console.log(`🚀 Bot v4 已啟動,port ${port}`);
-    console.log(`💽 資料儲存模式:${USE_CLOUD ? '☁️ JSONBin 雲端' : '💾 本機檔案(未設定 JSONBIN 環境變數)'}`);
-    console.log(`⏰ 每日備份時間(台灣時間):${DAILY_CRON}`);
+    console.log(`🚀 Bot v5.2 已啟動,port ${port}`);
+    console.log(`💽 儲存:${USE_CLOUD ? '☁️ JSONBin' : '💾 本機'}`);
+    console.log(`📊 每月推播上限:${MONTHLY_PUSH_LIMIT}(保留 ${QUOTA_RESERVE} 則給每日彙整)`);
+    console.log(`⏱️ 預設合併間隔:${DEFAULT_BUFFER_MIN} 分鐘`);
+    console.log(`⏰ 主要彙整時間:${DAILY_CRON}(${DAILY_TIME_TEXT})`);
+    console.log(`⏰ 加班場時間:${EXTRA_CRON || '(未設定)'}${EXTRA_CRON ? `,剩餘額度低於 ${EXTRA_MIN_REMAINING} 則時自動停辦` : ''}`);
   });
 });
